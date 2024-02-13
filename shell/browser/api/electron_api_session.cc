@@ -12,6 +12,7 @@
 #include <vector>
 
 #include "base/command_line.h"
+#include "base/containers/fixed_flat_map.h"
 #include "base/files/file_enumerator.h"
 #include "base/files/file_path.h"
 #include "base/files/file_util.h"
@@ -33,12 +34,14 @@
 #include "content/browser/code_cache/generated_code_cache_context.h"  // nogncheck
 #include "content/public/browser/browser_task_traits.h"
 #include "content/public/browser/browser_thread.h"
+#include "content/public/browser/browsing_data_filter_builder.h"
 #include "content/public/browser/browsing_data_remover.h"
 #include "content/public/browser/download_item_utils.h"
 #include "content/public/browser/download_manager_delegate.h"
 #include "content/public/browser/network_service_instance.h"
 #include "content/public/browser/storage_partition.h"
 #include "gin/arguments.h"
+#include "gin/converter.h"
 #include "mojo/public/cpp/bindings/pending_remote.h"
 #include "mojo/public/cpp/bindings/self_owned_receiver.h"
 #include "net/base/completion_repeating_callback.h"
@@ -117,25 +120,23 @@ struct ClearStorageDataOptions {
 };
 
 uint32_t GetStorageMask(const std::vector<std::string>& storage_types) {
+  static constexpr auto Lookup =
+      base::MakeFixedFlatMap<std::string_view, uint32_t>(
+          {{"cookies", StoragePartition::REMOVE_DATA_MASK_COOKIES},
+           {"filesystem", StoragePartition::REMOVE_DATA_MASK_FILE_SYSTEMS},
+           {"indexdb", StoragePartition::REMOVE_DATA_MASK_INDEXEDDB},
+           {"localstorage", StoragePartition::REMOVE_DATA_MASK_LOCAL_STORAGE},
+           {"shadercache", StoragePartition::REMOVE_DATA_MASK_SHADER_CACHE},
+           {"websql", StoragePartition::REMOVE_DATA_MASK_WEBSQL},
+           {"serviceworkers",
+            StoragePartition::REMOVE_DATA_MASK_SERVICE_WORKERS},
+           {"cachestorage", StoragePartition::REMOVE_DATA_MASK_CACHE_STORAGE}});
+
   uint32_t storage_mask = 0;
   for (const auto& it : storage_types) {
     auto type = base::ToLowerASCII(it);
-    if (type == "cookies")
-      storage_mask |= StoragePartition::REMOVE_DATA_MASK_COOKIES;
-    else if (type == "filesystem")
-      storage_mask |= StoragePartition::REMOVE_DATA_MASK_FILE_SYSTEMS;
-    else if (type == "indexdb")
-      storage_mask |= StoragePartition::REMOVE_DATA_MASK_INDEXEDDB;
-    else if (type == "localstorage")
-      storage_mask |= StoragePartition::REMOVE_DATA_MASK_LOCAL_STORAGE;
-    else if (type == "shadercache")
-      storage_mask |= StoragePartition::REMOVE_DATA_MASK_SHADER_CACHE;
-    else if (type == "websql")
-      storage_mask |= StoragePartition::REMOVE_DATA_MASK_WEBSQL;
-    else if (type == "serviceworkers")
-      storage_mask |= StoragePartition::REMOVE_DATA_MASK_SERVICE_WORKERS;
-    else if (type == "cachestorage")
-      storage_mask |= StoragePartition::REMOVE_DATA_MASK_CACHE_STORAGE;
+    if (Lookup.contains(type))
+      storage_mask |= Lookup.at(type);
   }
   return storage_mask;
 }
@@ -157,6 +158,52 @@ constexpr content::BrowsingDataRemover::OriginType kClearOriginTypeAll =
     content::BrowsingDataRemover::ORIGIN_TYPE_UNPROTECTED_WEB |
     content::BrowsingDataRemover::ORIGIN_TYPE_PROTECTED_WEB;
 
+struct ClearBrowsingDataOptions {
+  content::BrowsingDataRemover::DataType dataTypeMask = kClearDataTypeAll;
+  std::unique_ptr<content::BrowsingDataFilterBuilder> maybeFilter;
+};
+
+constexpr auto kDataTypeLookup =
+    base::MakeFixedFlatMap<std::string_view,
+                           content::BrowsingDataRemover::DataType>({
+        {"backgroundFetch",
+         content::BrowsingDataRemover::DATA_TYPE_BACKGROUND_FETCH},
+        {"cache", content::BrowsingDataRemover::DATA_TYPE_CACHE},
+        {"cacheStorage", content::BrowsingDataRemover::DATA_TYPE_CACHE_STORAGE},
+        {"cookies", content::BrowsingDataRemover::DATA_TYPE_COOKIES},
+        {"downloads", content::BrowsingDataRemover::DATA_TYPE_DOWNLOADS},
+        {"fileSystems", content::BrowsingDataRemover::DATA_TYPE_FILE_SYSTEMS},
+        {"indexedDB", content::BrowsingDataRemover::DATA_TYPE_INDEXED_DB},
+        {"localStorage", content::BrowsingDataRemover::DATA_TYPE_LOCAL_STORAGE},
+        {"mediaLicenses",
+         content::BrowsingDataRemover::DATA_TYPE_MEDIA_LICENSES},
+        {"serviceWorkers",
+         content::BrowsingDataRemover::DATA_TYPE_SERVICE_WORKERS},
+        {"webSQL", content::BrowsingDataRemover::DATA_TYPE_WEB_SQL},
+    });
+
+content::BrowsingDataRemover::DataType GetDataTypeMask(
+    const std::vector<std::string>& data_types) {
+  content::BrowsingDataRemover::DataType mask = 0u;
+  for (const auto& type : data_types) {
+    if (kDataTypeLookup.contains(type)) {
+      mask |= kDataTypeLookup.at(type);
+    }
+  }
+  return mask;
+}
+
+std::vector<std::string> GetDataTypesFromMask(
+    content::BrowsingDataRemover::DataType mask) {
+  std::vector<std::string> results;
+  for (const auto [type, flag] : kDataTypeLookup) {
+    if (mask & flag) {
+      results.emplace_back(type);
+    }
+  }
+  return results;
+}
+
 // Observes the BrowsingDataRemover that backs the `clearBrowsingData` method
 // and resolves/rejects that API's promise once it's done. This type manages its
 // own lifetime, deleting itself once it's done.
@@ -174,8 +221,22 @@ class ClearBrowsingDataObserver
     if (failed_data_types == 0ULL) {
       promise_.Resolve();
     } else {
-      promise_.RejectWithErrorMessage(base::StringPrintf(
-          "Failed to clear browsing data (%" PRIu64 ")", failed_data_types));
+      v8::Isolate* isolate = promise_.isolate();
+
+      v8::Local<v8::Value> failed_data_types_array =
+          gin::ConvertToV8(isolate, GetDataTypesFromMask(failed_data_types));
+
+      // Create a rich error object with extra detail about what data types
+      // failed
+      auto error = v8::Exception::Error(
+          gin::StringToV8(isolate, "Failed to clear browsing data"));
+      error.As<v8::Object>()
+          ->Set(promise_.GetContext(),
+                gin::StringToV8(isolate, "failedDataTypes"),
+                failed_data_types_array)
+          .Check();
+
+      promise_.Reject(error);
     }
     delete this;
   }
@@ -231,6 +292,87 @@ struct Converter<ClearStorageDataOptions> {
       out->storage_types = GetStorageMask(types);
     if (options.Get("quotas", &types))
       out->quota_types = GetQuotaMask(types);
+    return true;
+  }
+};
+
+template <>
+struct Converter<ClearBrowsingDataOptions> {
+  static bool FromV8(v8::Isolate* isolate,
+                     v8::Local<v8::Value> val,
+                     ClearBrowsingDataOptions* out) {
+    using content::BrowsingDataFilterBuilder;
+    using content::BrowsingDataRemover;
+
+    gin_helper::Dictionary options;
+    if (!ConvertFromV8(isolate, val, &options)) {
+      return false;
+    }
+
+    if (std::vector<std::string> data_types;
+        options.Get("dataTypes", &data_types)) {
+      out->dataTypeMask = GetDataTypeMask(data_types);
+    }
+    if (bool avoid_closing_connections;
+        options.Get("avoidClosingConnections", &avoid_closing_connections) &&
+        avoid_closing_connections) {
+      out->dataTypeMask |=
+          BrowsingDataRemover::DATA_TYPE_AVOID_CLOSING_CONNECTIONS;
+    }
+
+    std::vector<std::string> origin_strings;
+    bool excluding_origins = false;
+
+    bool has_origins_key = options.Get("origins", &origin_strings);
+    if (!has_origins_key) {
+      bool has_exclude_origins_key =
+          options.Get("excludeOrigins", &origin_strings);
+      excluding_origins = has_exclude_origins_key;
+    }
+
+    if (origin_strings.empty()) {
+      return true;
+    }
+
+    std::vector<url::Origin> origins(origin_strings.size());
+    for (const std::string& origin_string : origin_strings) {
+      auto origin = url::Origin::Create(GURL(origin_string));
+      // Skip opaque origins, they are invalid for this method.
+      if (origin.opaque()) {
+        continue;
+      }
+      origins.push_back(std::move(origin));
+    }
+
+    if (origins.empty()) {
+      return true;
+    }
+
+    BrowsingDataFilterBuilder::OriginMatchingMode origin_matching_mode =
+        BrowsingDataFilterBuilder::OriginMatchingMode::kThirdPartiesIncluded;
+    std::string origin_matching_mode_string;
+    if (options.Get("originMatchingMode", &origin_matching_mode_string)) {
+      if (origin_matching_mode_string == "third-parties-included") {
+        origin_matching_mode = BrowsingDataFilterBuilder::OriginMatchingMode::
+            kThirdPartiesIncluded;
+      } else if (origin_matching_mode_string == "origin-in-all-contexts") {
+        origin_matching_mode =
+            BrowsingDataFilterBuilder::OriginMatchingMode::kOriginInAllContexts;
+      }
+    }
+
+    BrowsingDataFilterBuilder::Mode mode =
+        excluding_origins ? BrowsingDataFilterBuilder::Mode::kPreserve
+                          : BrowsingDataFilterBuilder::Mode::kDelete;
+
+    auto filter = BrowsingDataFilterBuilder::Create(mode, origin_matching_mode);
+
+    for (const url::Origin& origin : origins) {
+      filter->AddOrigin(origin);
+    }
+
+    out->maybeFilter = std::move(filter);
+
     return true;
   }
 };
@@ -1141,15 +1283,21 @@ v8::Local<v8::Promise> Session::ClearCodeCaches(
 
 v8::Local<v8::Promise> Session::ClearBrowsingData(gin::Arguments* args) {
   auto* isolate = JavascriptEnvironment::GetIsolate();
-  gin_helper::Promise<void> promise(isolate);
-  v8::Local<v8::Promise> promise_handle = promise.GetHandle();
+
+  ClearBrowsingDataOptions options;
+  args->GetNext(&options);
 
   content::BrowsingDataRemover* remover =
       browser_context_->GetBrowsingDataRemover();
 
+  gin_helper::Promise<void> promise(isolate);
+  v8::Local<v8::Promise> promise_handle = promise.GetHandle();
+
   auto* observer = new ClearBrowsingDataObserver(std::move(promise), remover);
-  remover->RemoveAndReply(base::Time::Min(), base::Time::Max(),
-                          kClearDataTypeAll, kClearOriginTypeAll, observer);
+
+  remover->RemoveWithFilterAndReply(base::Time::Min(), base::Time::Max(),
+                                    options.dataTypeMask, kClearOriginTypeAll,
+                                    std::move(options.maybeFilter), observer);
 
   return promise_handle;
 }

@@ -1513,19 +1513,32 @@ is emitted.
 Returns `string | null` - The absolute file system path where data for this
 session is persisted on disk.  For in memory sessions this returns `null`.
 
-#### `ses.clearBrowsingData()`
+#### `ses.clearBrowsingData([options])`
+
+* `options` Object (optional)
+  * `dataTypes` String[] (optional) - The types of data to clear. If undefined, will clear all types of data. See method details for possible values.
+  * `origins` String[] (optional) - Clear data for only these origins. Cannot be used with `excludeOrigins`.
+  * `excludeOrigins` String[] (optional) - Clear data for all origins except these ones. Cannot be used with `origins`.
+  * `avoidClosingConnections` boolean (optional) - Skips deleting cookies that would close current network connections.
+  * `originMatchingMode` String (optional) - The behavior for matching data to origins. Valid values are `"third-parties-included"` and `"origin-in-all-contexts"`.
 
 Returns `Promise<void>` - resolves when all data has been cleared.
 
-This method clears many different types of data, inlcuding:
+Clears various different types of data.
 
-* Cache
-* Cookies
-* Downloads
-* IndexedDB
-* Local Storage
-* Service Workers
-* And more...
+`dataTypes` may include the following values:
+
+* **Background Fetch**: `backgroundFetch`
+* **Cache**: `cache`
+* **Cache Storage**: `cacheStorage`
+* **Cookies**: `cookies`
+* **Downloads**: `downloads`
+* **File Systems**: `fileSystems`
+* **IndexedDB**: `indexedDB`
+* **Local Storage**: `localStorage`
+* **Media Licenses**: `mediaLicenses`
+* **Service Workers**: `serviceWorkers`
+* **WebSQL**: `webSQL`
 
 This method clears more types of data than the `clearStorageData` method,
 however it is less configurable than that method.
