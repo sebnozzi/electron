@@ -1541,7 +1541,7 @@ Clears various different types of data.
 * **WebSQL**: `webSQL`
 
 This method clears more types of data than the `clearStorageData` method,
-however it is less configurable than that method.
+however it is less specific than that method.
 
 For more information, refer to Chromium's [`BrowsingDataRemover` interface](https://source.chromium.org/chromium/chromium/src/+/main:content/public/browser/browsing_data_remover.h).
 
