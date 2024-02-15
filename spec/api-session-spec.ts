@@ -1613,7 +1613,7 @@ describe('session module', () => {
 
     // NOTE: This API clears more than localStorage, but localStorage is a
     // convenient test target for this API
-    it('clears localstorage data', async () => {
+    it('clears all data when no options supplied', async () => {
       const w = new BrowserWindow({ show: false, webPreferences: { nodeIntegration: true } });
       await w.loadFile(path.join(fixtures, 'api', 'localstorage.html'));
 
@@ -1623,7 +1623,7 @@ describe('session module', () => {
 
       expect(await w.webContents.executeJavaScript('localStorage.length')).to.equal(0);
     });
-    it('clears localstorage data when called twice in parallel', async () => {
+    it('clears all data when no options supplied, called twice in parallel', async () => {
       const w = new BrowserWindow({ show: false, webPreferences: { nodeIntegration: true } });
       await w.loadFile(path.join(fixtures, 'api', 'localstorage.html'));
 
