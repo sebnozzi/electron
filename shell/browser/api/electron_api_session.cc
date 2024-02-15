@@ -1294,10 +1294,19 @@ v8::Local<v8::Promise> Session::ClearBrowsingData(gin::Arguments* args) {
   v8::Local<v8::Promise> promise_handle = promise.GetHandle();
 
   auto* observer = new ClearBrowsingDataObserver(std::move(promise), remover);
+  const base::Time& delete_begin = base::Time::Min();
+  const base::Time& delete_end = base::Time::Max();
+  content::BrowsingDataRemover::OriginType origin_type_mask =
+      kClearOriginTypeAll;
 
-  remover->RemoveWithFilterAndReply(base::Time::Min(), base::Time::Max(),
-                                    options.dataTypeMask, kClearOriginTypeAll,
-                                    std::move(options.maybeFilter), observer);
+  if (options.maybeFilter == nullptr) {
+    remover->RemoveAndReply(delete_begin, delete_end, options.dataTypeMask,
+                            origin_type_mask, observer);
+  } else {
+    remover->RemoveWithFilterAndReply(delete_begin, delete_end,
+                                      options.dataTypeMask, origin_type_mask,
+                                      std::move(options.maybeFilter), observer);
+  }
 
   return promise_handle;
 }
