@@ -11,6 +11,7 @@ import { closeAllWindows } from './lib/window-helpers';
 import { defer, listen } from './lib/spec-helpers';
 import { once } from 'node:events';
 import { setTimeout } from 'node:timers/promises';
+import { pathToFileURL } from 'node:url';
 
 describe('session module', () => {
   const fixtures = path.resolve(__dirname, 'fixtures');
@@ -1623,6 +1624,7 @@ describe('session module', () => {
 
       expect(await w.webContents.executeJavaScript('localStorage.length')).to.equal(0);
     });
+
     it('clears all data when no options supplied, called twice in parallel', async () => {
       const w = new BrowserWindow({ show: false, webPreferences: { nodeIntegration: true } });
       await w.loadFile(path.join(fixtures, 'api', 'localstorage.html'));
@@ -1637,6 +1639,93 @@ describe('session module', () => {
 
       // Await the first promise so it doesn't creep into another test
       await clearDataPromise;
+    });
+
+    it('only clears specified data categories', async () => {
+      const w = new BrowserWindow({ show: false, webPreferences: { nodeIntegration: true } });
+      const fixturePath = path.join(fixtures, 'api', 'localstorage.html');
+      await w.loadFile(fixturePath);
+
+      const { webContents } = w;
+      const { session } = webContents;
+
+      // Set a cookie on this session
+      const fixtureURLStr = pathToFileURL(fixturePath).toString();
+      await session.cookies.set({
+        url: fixtureURLStr,
+        expirationDate: Number.MAX_SAFE_INTEGER,
+        name: 'test',
+        value: 'test'
+      });
+      // DEBUG: expect((await ses.cookies.get({ url: fixtureURLStr, name: 'test' })).length).to.be.greaterThan(0);
+
+      // Make sure that there is data in localStorage
+      expect(await webContents.executeJavaScript('localStorage.length')).to.be.greaterThan(0);
+
+      // This first call is not awaited immediately
+      await session.clearBrowsingData({ dataTypes: ['cookies'] });
+
+      // The localStorage data should still be there
+      expect(await webContents.executeJavaScript('localStorage.length')).to.be.greaterThan(0);
+
+      // The cookie should be gone
+      expect((await session.cookies.get({ url: fixtureURLStr, name: 'test' })).length).to.equal(0);
+    });
+
+    it('only clears the specified origins', async () => {
+      const w = new BrowserWindow({ show: false });
+      await w.loadURL('about:blank');
+
+      const { session } = w.webContents;
+      const { cookies } = session;
+
+      await Promise.all([
+        cookies.set({
+          url: 'https://example.com/',
+          name: 'testdotcom',
+          value: 'testdotcom'
+        }),
+        cookies.set({
+          url: 'https://example.org/',
+          name: 'testdotorg',
+          value: 'testdotorg'
+        })
+      ]);
+
+      // TODO: Debug?
+
+      await session.clearBrowsingData({ origins: ['https://example.com'] });
+
+      expect((await cookies.get({ url: 'https://example.com/', name: 'testdotcom' })).length).to.equal(0);
+      expect((await cookies.get({ url: 'https://example.org/', name: 'testdotorg' })).length).to.be.greaterThan(0);
+    });
+
+    it('clears all except the specified origins', async () => {
+      const w = new BrowserWindow({ show: false });
+      await w.loadURL('about:blank');
+
+      const { session } = w.webContents;
+      const { cookies } = session;
+
+      await Promise.all([
+        cookies.set({
+          url: 'https://example.com/',
+          name: 'testdotcom',
+          value: 'testdotcom'
+        }),
+        cookies.set({
+          url: 'https://example.org/',
+          name: 'testdotorg',
+          value: 'testdotorg'
+        })
+      ]);
+
+      // TODO: Debug?
+
+      await session.clearBrowsingData({ excludeOrigins: ['https://example.com'] });
+
+      expect((await cookies.get({ url: 'https://example.com/', name: 'testdotcom' })).length).to.be.greaterThan(0);
+      expect((await cookies.get({ url: 'https://example.org/', name: 'testdotorg' })).length).to.equal(0);
     });
   });
 });
