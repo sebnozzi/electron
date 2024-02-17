@@ -89,6 +89,7 @@
 #include "third_party/blink/public/common/storage_key/storage_key.h"
 #include "third_party/blink/public/mojom/mediastream/media_stream.mojom.h"
 #include "ui/base/l10n/l10n_util.h"
+#include "url/origin.h"
 
 #if BUILDFLAG(ENABLE_ELECTRON_EXTENSIONS)
 #include "extensions/browser/extension_registry.h"
@@ -158,11 +159,6 @@ constexpr content::BrowsingDataRemover::OriginType kClearOriginTypeAll =
     content::BrowsingDataRemover::ORIGIN_TYPE_UNPROTECTED_WEB |
     content::BrowsingDataRemover::ORIGIN_TYPE_PROTECTED_WEB;
 
-struct ClearBrowsingDataOptions {
-  content::BrowsingDataRemover::DataType dataTypeMask = kClearDataTypeAll;
-  std::unique_ptr<content::BrowsingDataFilterBuilder> maybeFilter;
-};
-
 constexpr auto kDataTypeLookup =
     base::MakeFixedFlatMap<std::string_view,
                            content::BrowsingDataRemover::DataType>({
@@ -204,44 +200,128 @@ std::vector<std::string> GetDataTypesFromMask(
   return results;
 }
 
-// Observes the BrowsingDataRemover that backs the `clearBrowsingData` method
-// and resolves/rejects that API's promise once it's done. This type manages its
-// own lifetime, deleting itself once it's done.
-class ClearBrowsingDataObserver
-    : public content::BrowsingDataRemover::Observer {
+// Represents a task to clear browsing data for the `clearBrowsingData` API
+// method.
+//
+// This type manages its own lifetime, deleting itself once the task finishes
+// completely.
+class ClearBrowsingDataTask
+    : public content::BrowsingDataRemover::Observer,
+      public base::RefCountedThreadSafe<ClearBrowsingDataTask> {
  public:
-  ClearBrowsingDataObserver(gin_helper::Promise<void> promise,
-                            content::BrowsingDataRemover* remover)
+  // NOTE: This makes the ref count start at 1
+  REQUIRE_ADOPTION_FOR_REFCOUNTED_TYPE();
+
+  ClearBrowsingDataTask(content::BrowsingDataRemover* remover,
+                        gin_helper::Promise<void> promise,
+                        content::BrowsingDataRemover::DataType data_type_mask,
+                        std::vector<url::Origin> origins,
+                        content::BrowsingDataFilterBuilder::Mode filter_mode,
+                        content::BrowsingDataFilterBuilder::OriginMatchingMode
+                            origin_matching_mode)
       : promise_(std::move(promise)) {
     observation_.Observe(remover);
+
+    // Cookies are scoped more broadly than other types of data, so if we are
+    // filtering then we need to do it at the registrable domain level
+    if (!origins.empty() &&
+        data_type_mask & content::BrowsingDataRemover::DATA_TYPE_COOKIES) {
+      data_type_mask &= ~content::BrowsingDataRemover::DATA_TYPE_COOKIES;
+
+      auto cookies_filter_builder =
+          content::BrowsingDataFilterBuilder::Create(filter_mode);
+
+      for (const url::Origin& origin : origins) {
+        std::string domain = GetDomainAndRegistry(
+            origin,
+            net::registry_controlled_domains::INCLUDE_PRIVATE_REGISTRIES);
+        if (domain.empty()) {
+          domain = origin.host();
+        }
+        cookies_filter_builder->AddRegisterableDomain(domain);
+      }
+
+      StartOperation(remover, content::BrowsingDataRemover::DATA_TYPE_COOKIES,
+                     std::move(cookies_filter_builder));
+    }
+
+    // If cookies aren't the only data type and weren't handled above, then we
+    // can start an operation that is scoped to origins
+    if (data_type_mask) {
+      auto filter_builder = content::BrowsingDataFilterBuilder::Create(
+          filter_mode, origin_matching_mode);
+
+      for (auto const& origin : origins) {
+        filter_builder->AddOrigin(origin);
+      }
+      // TODO: if only one origin, should we set the storage key?
+
+      StartOperation(remover, data_type_mask, std::move(filter_builder));
+    }
+
+    // This constructor counts as an operation. Note that this class should
+    // start out with a reference count of 1, so this call also balances out the
+    // reference count.
+    OnOperationFinished();
   }
 
+  // content::BrowsingDataRemover::Observer:
   void OnBrowsingDataRemoverDone(
       content::BrowsingDataRemover::DataType failed_data_types) override {
-    if (failed_data_types == 0ULL) {
-      promise_.Resolve();
-    } else {
-      v8::Isolate* isolate = promise_.isolate();
-
-      v8::Local<v8::Value> failed_data_types_array =
-          gin::ConvertToV8(isolate, GetDataTypesFromMask(failed_data_types));
-
-      // Create a rich error object with extra detail about what data types
-      // failed
-      auto error = v8::Exception::Error(
-          gin::StringToV8(isolate, "Failed to clear browsing data"));
-      error.As<v8::Object>()
-          ->Set(promise_.GetContext(),
-                gin::StringToV8(isolate, "failedDataTypes"),
-                failed_data_types_array)
-          .Check();
-
-      promise_.Reject(error);
-    }
-    delete this;
+    failed_data_types_ |= failed_data_types;
+    OnOperationFinished();
   }
 
  private:
+  friend class base::RefCountedThreadSafe<ClearBrowsingDataTask>;
+  ~ClearBrowsingDataTask() = default;
+
+  void StartOperation(
+      content::BrowsingDataRemover* remover,
+      content::BrowsingDataRemover::DataType data_type_mask,
+      std::unique_ptr<content::BrowsingDataFilterBuilder> filter_builder) {
+    // This is matched with a release in |OnOperationFinished|
+    AddRef();
+
+    remover->RemoveWithFilterAndReply(base::Time::Min(), base::Time::Max(),
+                                      data_type_mask, kClearOriginTypeAll,
+                                      std::move(filter_builder), this);
+  }
+
+  void OnOperationFinished() {
+    DCHECK(HasAtLeastOneRef());
+
+    // If this is the last operation, then return the result before releasing
+    // the last reference and being destroyed
+    if (HasOneRef()) {
+      if (failed_data_types_ == 0ULL) {
+        promise_.Resolve();
+      } else {
+        v8::Isolate* isolate = promise_.isolate();
+
+        v8::Local<v8::Value> failed_data_types_array =
+            gin::ConvertToV8(isolate, GetDataTypesFromMask(failed_data_types_));
+
+        // Create a rich error object with extra detail about what data types
+        // failed
+        auto error = v8::Exception::Error(
+            gin::StringToV8(isolate, "Failed to clear browsing data"));
+        error.As<v8::Object>()
+            ->Set(promise_.GetContext(),
+                  gin::StringToV8(isolate, "failedDataTypes"),
+                  failed_data_types_array)
+            .Check();
+
+        promise_.Reject(error);
+      }
+    }
+
+    // Matches the increment in |StartOperation| (or the starting reference, if
+    // called by the constructor)
+    Release();
+  }
+
+  content::BrowsingDataRemover::DataType failed_data_types_ = 0ULL;
   gin_helper::Promise<void> promise_;
   base::ScopedObservation<content::BrowsingDataRemover,
                           content::BrowsingDataRemover::Observer>
@@ -292,87 +372,6 @@ struct Converter<ClearStorageDataOptions> {
       out->storage_types = GetStorageMask(types);
     if (options.Get("quotas", &types))
       out->quota_types = GetQuotaMask(types);
-    return true;
-  }
-};
-
-template <>
-struct Converter<ClearBrowsingDataOptions> {
-  static bool FromV8(v8::Isolate* isolate,
-                     v8::Local<v8::Value> val,
-                     ClearBrowsingDataOptions* out) {
-    using content::BrowsingDataFilterBuilder;
-    using content::BrowsingDataRemover;
-
-    gin_helper::Dictionary options;
-    if (!ConvertFromV8(isolate, val, &options)) {
-      return false;
-    }
-
-    if (std::vector<std::string> data_types;
-        options.Get("dataTypes", &data_types)) {
-      out->dataTypeMask = GetDataTypeMask(data_types);
-    }
-    if (bool avoid_closing_connections;
-        options.Get("avoidClosingConnections", &avoid_closing_connections) &&
-        avoid_closing_connections) {
-      out->dataTypeMask |=
-          BrowsingDataRemover::DATA_TYPE_AVOID_CLOSING_CONNECTIONS;
-    }
-
-    std::vector<std::string> origin_strings;
-    bool excluding_origins = false;
-
-    bool has_origins_key = options.Get("origins", &origin_strings);
-    if (!has_origins_key) {
-      bool has_exclude_origins_key =
-          options.Get("excludeOrigins", &origin_strings);
-      excluding_origins = has_exclude_origins_key;
-    }
-
-    if (origin_strings.empty()) {
-      return true;
-    }
-
-    std::vector<url::Origin> origins(origin_strings.size());
-    for (const std::string& origin_string : origin_strings) {
-      auto origin = url::Origin::Create(GURL(origin_string));
-      // Skip opaque origins, they are invalid for this method.
-      if (origin.opaque()) {
-        continue;
-      }
-      origins.push_back(std::move(origin));
-    }
-
-    if (origins.empty()) {
-      return true;
-    }
-
-    BrowsingDataFilterBuilder::OriginMatchingMode origin_matching_mode =
-        BrowsingDataFilterBuilder::OriginMatchingMode::kThirdPartiesIncluded;
-    std::string origin_matching_mode_string;
-    if (options.Get("originMatchingMode", &origin_matching_mode_string)) {
-      if (origin_matching_mode_string == "third-parties-included") {
-        origin_matching_mode = BrowsingDataFilterBuilder::OriginMatchingMode::
-            kThirdPartiesIncluded;
-      } else if (origin_matching_mode_string == "origin-in-all-contexts") {
-        origin_matching_mode =
-            BrowsingDataFilterBuilder::OriginMatchingMode::kOriginInAllContexts;
-      }
-    }
-
-    BrowsingDataFilterBuilder::Mode mode =
-        excluding_origins ? BrowsingDataFilterBuilder::Mode::kPreserve
-                          : BrowsingDataFilterBuilder::Mode::kDelete;
-
-    auto filter = BrowsingDataFilterBuilder::Create(mode, origin_matching_mode);
-
-    for (const url::Origin& origin : origins) {
-      filter->AddOrigin(origin);
-    }
-
-    out->maybeFilter = std::move(filter);
-
     return true;
   }
 };
@@ -1281,32 +1280,88 @@ v8::Local<v8::Promise> Session::ClearCodeCaches(
   return handle;
 }
 
-v8::Local<v8::Promise> Session::ClearBrowsingData(gin::Arguments* args) {
+v8::Local<v8::Promise> Session::ClearBrowsingData(
+    gin_helper::ErrorThrower thrower,
+    gin::Arguments* args) {
+  using content::BrowsingDataFilterBuilder;
+  using content::BrowsingDataRemover;
+
   auto* isolate = JavascriptEnvironment::GetIsolate();
 
-  ClearBrowsingDataOptions options;
-  args->GetNext(&options);
+  BrowsingDataRemover::DataType data_type_mask = kClearDataTypeAll;
+  std::vector<url::Origin> origins;
+  BrowsingDataFilterBuilder::OriginMatchingMode origin_matching_mode =
+      BrowsingDataFilterBuilder::OriginMatchingMode::kThirdPartiesIncluded;
+  BrowsingDataFilterBuilder::Mode filter_mode =
+      BrowsingDataFilterBuilder::Mode::kDelete;
 
-  content::BrowsingDataRemover* remover =
-      browser_context_->GetBrowsingDataRemover();
+  if (gin_helper::Dictionary options; args->GetNext(&options)) {
+    if (std::vector<std::string> data_types;
+        options.Get("dataTypes", &data_types)) {
+      data_type_mask = GetDataTypeMask(data_types);
+    }
+
+    if (bool avoid_closing_connections;
+        options.Get("avoidClosingConnections", &avoid_closing_connections) &&
+        avoid_closing_connections) {
+      data_type_mask |=
+          BrowsingDataRemover::DATA_TYPE_AVOID_CLOSING_CONNECTIONS;
+    }
+
+    std::vector<GURL> origin_urls;
+    {
+      bool has_origins_key = options.Get("origins", &origin_urls);
+      std::vector<GURL> exclude_origin_urls;
+      bool has_exclude_origins_key =
+          options.Get("excludeOrigins", &exclude_origin_urls);
+
+      if (has_origins_key && has_exclude_origins_key) {
+        thrower.ThrowError(
+            "Cannot provide both 'origins' and 'excludeOrigins'");
+        return v8::Undefined(isolate);
+      }
+
+      if (has_exclude_origins_key) {
+        origin_urls = std::move(exclude_origin_urls);
+      }
+    }
+
+    if (!origin_urls.empty()) {
+      origins.reserve(origin_urls.size());
+      for (const GURL& origin_url : origin_urls) {
+        auto origin = url::Origin::Create(origin_url);
+
+        // Opaque origins cannot be used with this API
+        if (origin.opaque()) {
+          thrower.ThrowError(
+              base::StringPrintf("Invalid origin: '%s'",
+                                 origin_url.possibly_invalid_spec().c_str()));
+          return v8::Undefined(isolate);
+        }
+
+        origins.push_back(std::move(origin));
+      }
+    }
+
+    if (std::string origin_matching_mode_string;
+        options.Get("originMatchingMode", &origin_matching_mode_string)) {
+      if (origin_matching_mode_string == "third-parties-included") {
+        origin_matching_mode = BrowsingDataFilterBuilder::OriginMatchingMode::
+            kThirdPartiesIncluded;
+      } else if (origin_matching_mode_string == "origin-in-all-contexts") {
+        origin_matching_mode =
+            BrowsingDataFilterBuilder::OriginMatchingMode::kOriginInAllContexts;
+      }
+    }
+  }
 
   gin_helper::Promise<void> promise(isolate);
   v8::Local<v8::Promise> promise_handle = promise.GetHandle();
 
-  auto* observer = new ClearBrowsingDataObserver(std::move(promise), remover);
-  const base::Time& delete_begin = base::Time::Min();
-  const base::Time& delete_end = base::Time::Max();
-  content::BrowsingDataRemover::OriginType origin_type_mask =
-      kClearOriginTypeAll;
-
-  if (options.maybeFilter == nullptr) {
-    remover->RemoveAndReply(delete_begin, delete_end, options.dataTypeMask,
-                            origin_type_mask, observer);
-  } else {
-    remover->RemoveWithFilterAndReply(delete_begin, delete_end,
-                                      options.dataTypeMask, origin_type_mask,
-                                      std::move(options.maybeFilter), observer);
-  }
+  BrowsingDataRemover* remover = browser_context_->GetBrowsingDataRemover();
+  new ClearBrowsingDataTask(remover, std::move(promise), data_type_mask,
+                            std::move(origins), filter_mode,
+                            origin_matching_mode);
 
   return promise_handle;
 }
