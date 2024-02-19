@@ -11,7 +11,6 @@ import { closeAllWindows } from './lib/window-helpers';
 import { defer, listen } from './lib/spec-helpers';
 import { once } from 'node:events';
 import { setTimeout } from 'node:timers/promises';
-import { pathToFileURL } from 'node:url';
 
 describe('session module', () => {
   const fixtures = path.resolve(__dirname, 'fixtures');
@@ -1642,34 +1641,38 @@ describe('session module', () => {
     });
 
     it('only clears specified data categories', async () => {
-      const w = new BrowserWindow({ show: false, webPreferences: { nodeIntegration: true } });
-      const fixturePath = path.join(fixtures, 'api', 'localstorage.html');
-      await w.loadFile(fixturePath);
+      const w = new BrowserWindow({
+        show: false,
+        webPreferences: { nodeIntegration: true, contextIsolation: false }
+      });
+      await w.loadFile(
+        path.join(fixtures, 'api', 'localstorage-and-indexeddb.html')
+      );
 
       const { webContents } = w;
       const { session } = webContents;
 
-      // Set a cookie on this session
-      const fixtureURLStr = pathToFileURL(fixturePath).toString();
-      await session.cookies.set({
-        url: fixtureURLStr,
-        expirationDate: Number.MAX_SAFE_INTEGER,
-        name: 'test',
-        value: 'test'
-      });
-      // DEBUG: expect((await ses.cookies.get({ url: fixtureURLStr, name: 'test' })).length).to.be.greaterThan(0);
+      await once(ipcMain, 'indexeddb-ready');
 
-      // Make sure that there is data in localStorage
-      expect(await webContents.executeJavaScript('localStorage.length')).to.be.greaterThan(0);
+      async function queryData (channel: string): Promise<string> {
+        const event = once(ipcMain, `result-${channel}`);
+        webContents.send(`get-${channel}`);
+        return (await event)[1];
+      }
 
-      // This first call is not awaited immediately
-      await session.clearBrowsingData({ dataTypes: ['cookies'] });
+      // Data is in localStorage
+      await expect(queryData('localstorage')).to.eventually.equal('hello localstorage');
+      // Data is in indexedDB
+      await expect(queryData('indexeddb')).to.eventually.equal('hello indexeddb');
+
+      // Clear only indexedDB, not localStorage
+      await session.clearBrowsingData({ dataTypes: ['indexedDB'] });
 
       // The localStorage data should still be there
-      expect(await webContents.executeJavaScript('localStorage.length')).to.be.greaterThan(0);
+      await expect(queryData('localstorage')).to.eventually.equal('hello localstorage');
 
-      // The cookie should be gone
-      expect((await session.cookies.get({ url: fixtureURLStr, name: 'test' })).length).to.equal(0);
+      // The indexedDB data should be gone
+      await expect(queryData('indexeddb')).to.eventually.be.undefined();
     });
 
     it('only clears the specified origins', async () => {
@@ -1691,8 +1694,6 @@ describe('session module', () => {
           value: 'testdotorg'
         })
       ]);
-
-      // TODO: Debug?
 
       await session.clearBrowsingData({ origins: ['https://example.com'] });
 
@@ -1719,8 +1720,6 @@ describe('session module', () => {
           value: 'testdotorg'
         })
       ]);
-
-      // TODO: Debug?
 
       await session.clearBrowsingData({ excludeOrigins: ['https://example.com'] });
 
