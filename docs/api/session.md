@@ -1526,7 +1526,7 @@ Returns `Promise<void>` - resolves when all data has been cleared.
 
 Clears various different types of data.
 
-`dataTypes` may include the following values:
+`dataTypes` may include the following case-sensitive string values:
 
 * **Background Fetch**: `backgroundFetch`
 * **Cache**: `cache`
