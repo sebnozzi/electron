@@ -17,6 +17,7 @@
 #include "base/files/file_path.h"
 #include "base/files/file_util.h"
 #include "base/memory/raw_ptr.h"
+#include "base/memory/scoped_refptr.h"
 #include "base/scoped_observation.h"
 #include "base/strings/string_util.h"
 #include "base/strings/stringprintf.h"
@@ -110,6 +111,8 @@
 #endif
 
 using content::BrowserThread;
+using content::BrowsingDataFilterBuilder;
+using content::BrowsingDataRemover;
 using content::StoragePartition;
 
 namespace {
@@ -154,33 +157,29 @@ uint32_t GetQuotaMask(const std::vector<std::string>& quota_types) {
   return quota_mask;
 }
 
-constexpr content::BrowsingDataRemover::DataType kClearDataTypeAll = ~0ULL;
-constexpr content::BrowsingDataRemover::OriginType kClearOriginTypeAll =
-    content::BrowsingDataRemover::ORIGIN_TYPE_UNPROTECTED_WEB |
-    content::BrowsingDataRemover::ORIGIN_TYPE_PROTECTED_WEB;
+constexpr BrowsingDataRemover::DataType kClearDataTypeAll = ~0ULL;
+constexpr BrowsingDataRemover::OriginType kClearOriginTypeAll =
+    BrowsingDataRemover::ORIGIN_TYPE_UNPROTECTED_WEB |
+    BrowsingDataRemover::ORIGIN_TYPE_PROTECTED_WEB;
 
 constexpr auto kDataTypeLookup =
-    base::MakeFixedFlatMap<std::string_view,
-                           content::BrowsingDataRemover::DataType>({
-        {"backgroundFetch",
-         content::BrowsingDataRemover::DATA_TYPE_BACKGROUND_FETCH},
-        {"cache", content::BrowsingDataRemover::DATA_TYPE_CACHE},
-        {"cacheStorage", content::BrowsingDataRemover::DATA_TYPE_CACHE_STORAGE},
-        {"cookies", content::BrowsingDataRemover::DATA_TYPE_COOKIES},
-        {"downloads", content::BrowsingDataRemover::DATA_TYPE_DOWNLOADS},
-        {"fileSystems", content::BrowsingDataRemover::DATA_TYPE_FILE_SYSTEMS},
-        {"indexedDB", content::BrowsingDataRemover::DATA_TYPE_INDEXED_DB},
-        {"localStorage", content::BrowsingDataRemover::DATA_TYPE_LOCAL_STORAGE},
-        {"mediaLicenses",
-         content::BrowsingDataRemover::DATA_TYPE_MEDIA_LICENSES},
-        {"serviceWorkers",
-         content::BrowsingDataRemover::DATA_TYPE_SERVICE_WORKERS},
-        {"webSQL", content::BrowsingDataRemover::DATA_TYPE_WEB_SQL},
+    base::MakeFixedFlatMap<std::string_view, BrowsingDataRemover::DataType>({
+        {"backgroundFetch", BrowsingDataRemover::DATA_TYPE_BACKGROUND_FETCH},
+        {"cache", BrowsingDataRemover::DATA_TYPE_CACHE},
+        {"cacheStorage", BrowsingDataRemover::DATA_TYPE_CACHE_STORAGE},
+        {"cookies", BrowsingDataRemover::DATA_TYPE_COOKIES},
+        {"downloads", BrowsingDataRemover::DATA_TYPE_DOWNLOADS},
+        {"fileSystems", BrowsingDataRemover::DATA_TYPE_FILE_SYSTEMS},
+        {"indexedDB", BrowsingDataRemover::DATA_TYPE_INDEXED_DB},
+        {"localStorage", BrowsingDataRemover::DATA_TYPE_LOCAL_STORAGE},
+        {"mediaLicenses", BrowsingDataRemover::DATA_TYPE_MEDIA_LICENSES},
+        {"serviceWorkers", BrowsingDataRemover::DATA_TYPE_SERVICE_WORKERS},
+        {"webSQL", BrowsingDataRemover::DATA_TYPE_WEB_SQL},
     });
 
-content::BrowsingDataRemover::DataType GetDataTypeMask(
+BrowsingDataRemover::DataType GetDataTypeMask(
     const std::vector<std::string>& data_types) {
-  content::BrowsingDataRemover::DataType mask = 0u;
+  BrowsingDataRemover::DataType mask = 0u;
   for (const auto& type : data_types) {
     if (kDataTypeLookup.contains(type)) {
       mask |= kDataTypeLookup.at(type);
@@ -190,7 +189,7 @@ content::BrowsingDataRemover::DataType GetDataTypeMask(
 }
 
 std::vector<std::string> GetDataTypesFromMask(
-    content::BrowsingDataRemover::DataType mask) {
+    BrowsingDataRemover::DataType mask) {
   std::vector<std::string> results;
   for (const auto [type, flag] : kDataTypeLookup) {
     if (mask & flag) {
@@ -206,30 +205,36 @@ std::vector<std::string> GetDataTypesFromMask(
 // This type manages its own lifetime, deleting itself once the task finishes
 // completely.
 class ClearBrowsingDataTask
-    : public content::BrowsingDataRemover::Observer,
+    : public BrowsingDataRemover::Observer,
       public base::RefCountedThreadSafe<ClearBrowsingDataTask> {
  public:
-  // NOTE: This makes the ref count start at 1
   REQUIRE_ADOPTION_FOR_REFCOUNTED_TYPE();
 
-  ClearBrowsingDataTask(content::BrowsingDataRemover* remover,
-                        gin_helper::Promise<void> promise,
-                        content::BrowsingDataRemover::DataType data_type_mask,
-                        std::vector<url::Origin> origins,
-                        content::BrowsingDataFilterBuilder::Mode filter_mode,
-                        content::BrowsingDataFilterBuilder::OriginMatchingMode
-                            origin_matching_mode)
-      : promise_(std::move(promise)) {
-    observation_.Observe(remover);
+  // Starts running a task. This function will return before the task is
+  // finished, but will resolve or reject the |promise| when it finishes.
+  static void Run(
+      BrowsingDataRemover* remover,
+      gin_helper::Promise<void> promise,
+      BrowsingDataRemover::DataType data_type_mask,
+      std::vector<url::Origin> origins,
+      BrowsingDataFilterBuilder::Mode filter_mode,
+      BrowsingDataFilterBuilder::OriginMatchingMode origin_matching_mode) {
+    auto task = base::MakeRefCounted<ClearBrowsingDataTask>(remover,
+                                                            std::move(promise));
+
+    // This method counts as an operation. This is important so we can call
+    // `OnOperationFinished` at the end of this method as a fallback if all the
+    // other operations finished while this method was still executing
+    task->operations_running_ = 1;
 
     // Cookies are scoped more broadly than other types of data, so if we are
     // filtering then we need to do it at the registrable domain level
     if (!origins.empty() &&
-        data_type_mask & content::BrowsingDataRemover::DATA_TYPE_COOKIES) {
-      data_type_mask &= ~content::BrowsingDataRemover::DATA_TYPE_COOKIES;
+        data_type_mask & BrowsingDataRemover::DATA_TYPE_COOKIES) {
+      data_type_mask &= ~BrowsingDataRemover::DATA_TYPE_COOKIES;
 
       auto cookies_filter_builder =
-          content::BrowsingDataFilterBuilder::Create(filter_mode);
+          BrowsingDataFilterBuilder::Create(filter_mode);
 
       for (const url::Origin& origin : origins) {
         std::string domain = GetDomainAndRegistry(
@@ -241,47 +246,64 @@ class ClearBrowsingDataTask
         cookies_filter_builder->AddRegisterableDomain(domain);
       }
 
-      StartOperation(remover, content::BrowsingDataRemover::DATA_TYPE_COOKIES,
-                     std::move(cookies_filter_builder));
+      task->StartOperation(remover, BrowsingDataRemover::DATA_TYPE_COOKIES,
+                           std::move(cookies_filter_builder));
     }
 
     // If cookies aren't the only data type and weren't handled above, then we
     // can start an operation that is scoped to origins
     if (data_type_mask) {
-      auto filter_builder = content::BrowsingDataFilterBuilder::Create(
-          filter_mode, origin_matching_mode);
+      auto filter_builder =
+          BrowsingDataFilterBuilder::Create(filter_mode, origin_matching_mode);
 
       for (auto const& origin : origins) {
         filter_builder->AddOrigin(origin);
       }
       // TODO: if only one origin, should we set the storage key?
 
-      StartOperation(remover, data_type_mask, std::move(filter_builder));
+      task->StartOperation(remover, data_type_mask, std::move(filter_builder));
     }
 
-    // This constructor counts as an operation. Note that this class should
+    // This static method counts as an operation. Note that this class should
     // start out with a reference count of 1, so this call also balances out the
     // reference count.
-    OnOperationFinished();
+    task->OnOperationFinished();
   }
 
-  // content::BrowsingDataRemover::Observer:
+  // BrowsingDataRemover::Observer:
   void OnBrowsingDataRemoverDone(
-      content::BrowsingDataRemover::DataType failed_data_types) override {
+      BrowsingDataRemover::DataType failed_data_types) override {
     failed_data_types_ |= failed_data_types;
     OnOperationFinished();
+
+    // Matches the increment in |StartOperation|
+    Release();
   }
 
  private:
+  // Friending |base::MakeRefCounted| so it can call the constructor
+  template <typename T, typename... Args>
+  friend scoped_refptr<T> base::MakeRefCounted(Args&&... args);
+
+  ClearBrowsingDataTask(BrowsingDataRemover* remover,
+                        gin_helper::Promise<void> promise)
+      : promise_(std::move(promise)) {
+    observation_.Observe(remover);
+  }
+
+  // Friending |base::RefCountedThreadSafe| so it can call the destructor
   friend class base::RefCountedThreadSafe<ClearBrowsingDataTask>;
-  ~ClearBrowsingDataTask() = default;
+  ~ClearBrowsingDataTask() override = default;
 
   void StartOperation(
-      content::BrowsingDataRemover* remover,
-      content::BrowsingDataRemover::DataType data_type_mask,
-      std::unique_ptr<content::BrowsingDataFilterBuilder> filter_builder) {
-    // This is matched with a release in |OnOperationFinished|
+      BrowsingDataRemover* remover,
+      BrowsingDataRemover::DataType data_type_mask,
+      std::unique_ptr<BrowsingDataFilterBuilder> filter_builder) {
+    // This is matched with a release in |OnBrowsingDataRemoverDone|, for the
+    // reference to |this| given to |RemoveWithFilterAndReply| below.
     AddRef();
+    // Track this operation
+    operations_running_ += 1;
 
     remover->RemoveWithFilterAndReply(base::Time::Min(), base::Time::Max(),
                                       data_type_mask, kClearOriginTypeAll,
@@ -289,11 +311,12 @@ class ClearBrowsingDataTask
   }
 
   void OnOperationFinished() {
-    DCHECK(HasAtLeastOneRef());
+    DCHECK_GT(operations_running_, 0);
+    operations_running_ -= 1;
 
     // If this is the last operation, then return the result before releasing
     // the last reference and being destroyed
-    if (HasOneRef()) {
+    if (operations_running_ == 0) {
       if (failed_data_types_ == 0ULL) {
         promise_.Resolve();
       } else {
@@ -315,16 +338,12 @@ class ClearBrowsingDataTask
         promise_.Reject(error);
       }
     }
-
-    // Matches the increment in |StartOperation| (or the starting reference, if
-    // called by the constructor)
-    Release();
   }
 
-  content::BrowsingDataRemover::DataType failed_data_types_ = 0ULL;
+  int operations_running_ = 0;
+  BrowsingDataRemover::DataType failed_data_types_ = 0ULL;
   gin_helper::Promise<void> promise_;
-  base::ScopedObservation<content::BrowsingDataRemover,
-                          content::BrowsingDataRemover::Observer>
+  base::ScopedObservation<BrowsingDataRemover, BrowsingDataRemover::Observer>
       observation_{this};
 };
 
@@ -1280,12 +1299,9 @@ v8::Local<v8::Promise> Session::ClearCodeCaches(
   return handle;
 }
 
-v8::Local<v8::Promise> Session::ClearBrowsingData(
+v8::Local<v8::Value> Session::ClearBrowsingData(
     gin_helper::ErrorThrower thrower,
     gin::Arguments* args) {
-  using content::BrowsingDataFilterBuilder;
-  using content::BrowsingDataRemover;
-
   auto* isolate = JavascriptEnvironment::GetIsolate();
 
   BrowsingDataRemover::DataType data_type_mask = kClearDataTypeAll;
@@ -1293,7 +1309,7 @@ v8::Local<v8::Promise> Session::ClearBrowsingData(
   BrowsingDataFilterBuilder::OriginMatchingMode origin_matching_mode =
       BrowsingDataFilterBuilder::OriginMatchingMode::kThirdPartiesIncluded;
   BrowsingDataFilterBuilder::Mode filter_mode =
-      BrowsingDataFilterBuilder::Mode::kDelete;
+      BrowsingDataFilterBuilder::Mode::kPreserve;
 
   if (gin_helper::Dictionary options; args->GetNext(&options)) {
     if (std::vector<std::string> data_types;
@@ -1359,9 +1375,9 @@ v8::Local<v8::Promise> Session::ClearBrowsingData(
   v8::Local<v8::Promise> promise_handle = promise.GetHandle();
 
   BrowsingDataRemover* remover = browser_context_->GetBrowsingDataRemover();
-  new ClearBrowsingDataTask(remover, std::move(promise), data_type_mask,
-                            std::move(origins), filter_mode,
-                            origin_matching_mode);
+  ClearBrowsingDataTask::Run(remover, std::move(promise), data_type_mask,
+                             std::move(origins), filter_mode,
+                             origin_matching_mode);
 
   return promise_handle;
 }
