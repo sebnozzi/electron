@@ -1337,7 +1337,9 @@ v8::Local<v8::Value> Session::ClearBrowsingData(
         return v8::Undefined(isolate);
       }
 
-      if (has_exclude_origins_key) {
+      if (has_origins_key) {
+        filter_mode = BrowsingDataFilterBuilder::Mode::kDelete;
+      } else if (has_exclude_origins_key) {
         origin_urls = std::move(exclude_origin_urls);
       }
     }
