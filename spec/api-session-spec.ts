@@ -1608,7 +1608,7 @@ describe('session module', () => {
     });
   });
 
-  describe('ses.clearBrowsingData()', () => {
+  describe('ses.clearData()', () => {
     afterEach(closeAllWindows);
 
     // NOTE: This API clears more than localStorage, but localStorage is a
@@ -1619,7 +1619,7 @@ describe('session module', () => {
 
       expect(await w.webContents.executeJavaScript('localStorage.length')).to.be.greaterThan(0);
 
-      await w.webContents.session.clearBrowsingData();
+      await w.webContents.session.clearData();
 
       expect(await w.webContents.executeJavaScript('localStorage.length')).to.equal(0);
     });
@@ -1631,8 +1631,8 @@ describe('session module', () => {
       expect(await w.webContents.executeJavaScript('localStorage.length')).to.be.greaterThan(0);
 
       // This first call is not awaited immediately
-      const clearDataPromise = w.webContents.session.clearBrowsingData();
-      await w.webContents.session.clearBrowsingData();
+      const clearDataPromise = w.webContents.session.clearData();
+      await w.webContents.session.clearData();
 
       expect(await w.webContents.executeJavaScript('localStorage.length')).to.equal(0);
 
@@ -1666,7 +1666,7 @@ describe('session module', () => {
       await expect(queryData('indexeddb')).to.eventually.equal('hello indexeddb');
 
       // Clear only indexedDB, not localStorage
-      await session.clearBrowsingData({ dataTypes: ['indexedDB'] });
+      await session.clearData({ dataTypes: ['indexedDB'] });
 
       // The localStorage data should still be there
       await expect(queryData('localstorage')).to.eventually.equal('hello localstorage');
@@ -1695,7 +1695,7 @@ describe('session module', () => {
         })
       ]);
 
-      await session.clearBrowsingData({ origins: ['https://example.com'] });
+      await session.clearData({ origins: ['https://example.com'] });
 
       expect((await cookies.get({ url: 'https://example.com/', name: 'testdotcom' })).length).to.equal(0);
       expect((await cookies.get({ url: 'https://example.org/', name: 'testdotorg' })).length).to.be.greaterThan(0);
@@ -1721,7 +1721,7 @@ describe('session module', () => {
         })
       ]);
 
-      await session.clearBrowsingData({ excludeOrigins: ['https://example.com'] });
+      await session.clearData({ excludeOrigins: ['https://example.com'] });
 
       expect((await cookies.get({ url: 'https://example.com/', name: 'testdotcom' })).length).to.be.greaterThan(0);
       expect((await cookies.get({ url: 'https://example.org/', name: 'testdotorg' })).length).to.equal(0);

@@ -199,14 +199,12 @@ std::vector<std::string> GetDataTypesFromMask(
   return results;
 }
 
-// Represents a task to clear browsing data for the `clearBrowsingData` API
-// method.
+// Represents a task to clear browsing data for the `clearData` API method.
 //
 // This type manages its own lifetime, deleting itself once the task finishes
 // completely.
-class ClearBrowsingDataTask
-    : public BrowsingDataRemover::Observer,
-      public base::RefCountedThreadSafe<ClearBrowsingDataTask> {
+class ClearDataTask : public BrowsingDataRemover::Observer,
+                      public base::RefCountedThreadSafe<ClearDataTask> {
  public:
   REQUIRE_ADOPTION_FOR_REFCOUNTED_TYPE();
 
@@ -219,8 +217,8 @@ class ClearBrowsingDataTask
       std::vector<url::Origin> origins,
       BrowsingDataFilterBuilder::Mode filter_mode,
       BrowsingDataFilterBuilder::OriginMatchingMode origin_matching_mode) {
-    auto task = base::MakeRefCounted<ClearBrowsingDataTask>(remover,
-                                                            std::move(promise));
+    auto task =
+        base::MakeRefCounted<ClearDataTask>(remover, std::move(promise));
 
     // This method counts as an operation. This is important so we can call
     // `OnOperationFinished` at the end of this method as a fallback if all the
@@ -285,15 +283,14 @@ class ClearBrowsingDataTask
   template <typename T, typename... Args>
   friend scoped_refptr<T> base::MakeRefCounted(Args&&... args);
 
-  ClearBrowsingDataTask(BrowsingDataRemover* remover,
-                        gin_helper::Promise<void> promise)
+  ClearDataTask(BrowsingDataRemover* remover, gin_helper::Promise<void> promise)
       : promise_(std::move(promise)) {
     observation_.Observe(remover);
   }
 
   // Friending |base::RefCountedThreadSafe| so it can call the destructor
-  friend class base::RefCountedThreadSafe<ClearBrowsingDataTask>;
-  ~ClearBrowsingDataTask() override = default;
+  friend class base::RefCountedThreadSafe<ClearDataTask>;
+  ~ClearDataTask() override = default;
 
   void StartOperation(
       BrowsingDataRemover* remover,
@@ -328,7 +325,7 @@ class ClearBrowsingDataTask
         // Create a rich error object with extra detail about what data types
         // failed
         auto error = v8::Exception::Error(
-            gin::StringToV8(isolate, "Failed to clear browsing data"));
+            gin::StringToV8(isolate, "Failed to clear data"));
         error.As<v8::Object>()
             ->Set(promise_.GetContext(),
                   gin::StringToV8(isolate, "failedDataTypes"),
@@ -1299,9 +1296,8 @@ v8::Local<v8::Promise> Session::ClearCodeCaches(
   return handle;
 }
 
-v8::Local<v8::Value> Session::ClearBrowsingData(
-    gin_helper::ErrorThrower thrower,
-    gin::Arguments* args) {
+v8::Local<v8::Value> Session::ClearData(gin_helper::ErrorThrower thrower,
+                                        gin::Arguments* args) {
   auto* isolate = JavascriptEnvironment::GetIsolate();
 
   BrowsingDataRemover::DataType data_type_mask = kClearDataTypeAll;
@@ -1377,9 +1373,8 @@ v8::Local<v8::Value> Session::ClearBrowsingData(
   v8::Local<v8::Promise> promise_handle = promise.GetHandle();
 
   BrowsingDataRemover* remover = browser_context_->GetBrowsingDataRemover();
-  ClearBrowsingDataTask::Run(remover, std::move(promise), data_type_mask,
-                             std::move(origins), filter_mode,
-                             origin_matching_mode);
+  ClearDataTask::Run(remover, std::move(promise), data_type_mask,
+                     std::move(origins), filter_mode, origin_matching_mode);
 
   return promise_handle;
 }
@@ -1653,7 +1648,7 @@ void Session::FillObjectTemplate(v8::Isolate* isolate,
       .SetMethod("getStoragePath", &Session::GetPath)
       .SetMethod("setCodeCachePath", &Session::SetCodeCachePath)
       .SetMethod("clearCodeCaches", &Session::ClearCodeCaches)
-      .SetMethod("clearBrowsingData", &Session::ClearBrowsingData)
+      .SetMethod("clearData", &Session::ClearData)
       .SetProperty("cookies", &Session::Cookies)
       .SetProperty("netLog", &Session::NetLog)
       .SetProperty("protocol", &Session::Protocol)
