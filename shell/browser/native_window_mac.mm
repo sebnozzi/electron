@@ -1156,7 +1156,7 @@ void NativeWindowMac::SetKiosk(bool kiosk) {
         NSApplicationPresentationHideDock |
         NSApplicationPresentationHideMenuBar |
         NSApplicationPresentationDisableAppleMenu |
-        NSApplicationPresentationDisableProcessSwitching |
+        // NSApplicationPresentationDisableProcessSwitching |
         NSApplicationPresentationDisableForceQuit |
         NSApplicationPresentationDisableSessionTermination |
         NSApplicationPresentationDisableHideApplication;
